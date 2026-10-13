@@ -1,15 +1,67 @@
+
 name: FBSPL PR Security Checks
 
 on:
-  
   push:
+    branches: [DevOps]
+  pull_request:
     branches: [DevOps]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # 0. Detect the project stacks and package manager
+  detect-stack:
+    name: Detect Project Stack
+    runs-on: ubuntu-latest
+    outputs:
+      node: ${{ steps.detect.outputs.node }}
+      python: ${{ steps.detect.outputs.python }}
+      docker: ${{ steps.detect.outputs.docker }}
+      node_manager: ${{ steps.detect.outputs.node_manager }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Detect project files
+        id: detect
+        shell: bash
+        run: |
+          if [ -f package.json ]; then
+            echo "node=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "node=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f requirements.txt ] || [ -f pyproject.toml ]; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f Dockerfile ]; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f pnpm-lock.yaml ] && [ -f package-lock.json ]; then
+            echo "node_manager=conflict" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "node_manager=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f package-lock.json ]; then
+            echo "node_manager=npm" >> "$GITHUB_OUTPUT"
+          else
+            echo "node_manager=none" >> "$GITHUB_OUTPUT"
+          fi
+
   # 1. Secret scanning
   gitleaks:
     name: Gitleaks Secret Scan
@@ -27,7 +79,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # 2. Static application security testing (SAST)
+  # 2. Static application security testing
   codeql:
     name: CodeQL SAST
     runs-on: ubuntu-latest
@@ -59,9 +111,6 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Check dependency changes
         uses: actions/dependency-review-action@v4
         with:
@@ -71,78 +120,120 @@ jobs:
   node-security:
     name: Node.js Security and Quality
     runs-on: ubuntu-latest
-    if: hashFiles('package.json') != ''
+    needs: detect-stack
+    if: needs.detect-stack.outputs.node == 'true'
     permissions:
       contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate package manager
+        shell: bash
+        env:
+          NODE_MANAGER: ${{ needs.detect-stack.outputs.node_manager }}
+        run: |
+          set -euo pipefail
+          if [ "$NODE_MANAGER" = "conflict" ]; then
+            echo "Both pnpm-lock.yaml and package-lock.json exist."
+            echo "Keep only the intended package manager lockfile."
+            exit 1
+          fi
+
+          if [ "$NODE_MANAGER" = "none" ]; then
+            echo "No supported lockfile found."
+            echo "Commit pnpm-lock.yaml or package-lock.json."
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        if: needs.detect-stack.outputs.node_manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10.32.1'
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Install pnpm
-        if: hashFiles('pnpm-lock.yaml') != ''
-        uses: pnpm/action-setup@v4
-        with:
-          version: '10.32.1'
+          cache: ${{ needs.detect-stack.outputs.node_manager == 'pnpm' && 'pnpm' || 'npm' }}
 
       - name: Install and audit pnpm dependencies
-        if: hashFiles('pnpm-lock.yaml') != ''
+        if: needs.detect-stack.outputs.node_manager == 'pnpm'
+        shell: bash
         run: |
           set -euo pipefail
           pnpm install --frozen-lockfile
           pnpm audit --audit-level high
 
       - name: Install and audit npm dependencies
-        if: hashFiles('package-lock.json') != ''
+        if: needs.detect-stack.outputs.node_manager == 'npm'
+        shell: bash
         run: |
           set -euo pipefail
           npm ci
           npm audit --audit-level=high
 
-      - name: Fail if no supported lockfile exists
-        if: hashFiles('pnpm-lock.yaml') == '' && hashFiles('package-lock.json') == ''
-        run: |
-          echo "Commit pnpm-lock.yaml or package-lock.json."
-          exit 1
-
       - name: Run lint
+        shell: bash
+        env:
+          NODE_MANAGER: ${{ needs.detect-stack.outputs.node_manager }}
         run: |
+          set -euo pipefail
           if node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)"; then
-            if [ -f pnpm-lock.yaml ]; then pnpm lint; else npm run lint; fi
+            if [ "$NODE_MANAGER" = "pnpm" ]; then
+              pnpm lint
+            else
+              npm run lint
+            fi
           else
-            echo "No lint script configured; configure one for this repository."
+            echo "No lint script configured; skipping."
           fi
 
       - name: Run tests
+        shell: bash
+        env:
+          NODE_MANAGER: ${{ needs.detect-stack.outputs.node_manager }}
         run: |
+          set -euo pipefail
           if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
-            if [ -f pnpm-lock.yaml ]; then pnpm test; else npm test; fi
+            if [ "$NODE_MANAGER" = "pnpm" ]; then
+              pnpm test
+            else
+              npm test
+            fi
           else
-            echo "No test script configured; add tests for stronger coverage."
+            echo "No test script configured; skipping."
           fi
 
       - name: Build application
+        shell: bash
         env:
+          NODE_MANAGER: ${{ needs.detect-stack.outputs.node_manager }}
           NEXT_PUBLIC_API_BASE_URL: ${{ vars.NEXT_PUBLIC_API_BASE_URL }}
         run: |
-          if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
-            if [ -f pnpm-lock.yaml ]; then pnpm build; else npm run build; fi
-          else
+          set -euo pipefail
+          if ! node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
             echo "No build script found."
             exit 1
+          fi
+
+          if [ "$NODE_MANAGER" = "pnpm" ]; then
+            pnpm build
+          else
+            npm run build
           fi
 
   # 5. Python dependency security and tests
   python-security:
     name: Python Security and Quality
     runs-on: ubuntu-latest
-    if: hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != ''
+    needs: detect-stack
+    if: needs.detect-stack.outputs.python == 'true'
     permissions:
       contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -153,39 +244,50 @@ jobs:
           python-version: '3.12'
 
       - name: Install project dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          if [ -f pyproject.toml ]; then pip install .; fi
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+
+          if [ -f pyproject.toml ]; then
+            python -m pip install .
+          fi
 
       - name: Audit Python dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install pip-audit
+
           if [ -f requirements.txt ]; then
-            pip-audit -r requirements.txt
-          elif [ -f pyproject.toml ]; then
-            pip-audit
+            python -m pip_audit -r requirements.txt
           else
-            echo "No supported dependency manifest found."
-            exit 1
+            python -m pip_audit
           fi
 
       - name: Compile Python files
         run: python -m compileall -q .
 
       - name: Run pytest when tests exist
+        shell: bash
         run: |
+          set -euo pipefail
           if [ -d tests ]; then
             python -m pip install pytest
-            pytest
+            python -m pytest
           else
-            echo "No tests directory found; add project tests."
+            echo "No tests directory found; skipping."
           fi
 
-  # 6. Filesystem, secrets, dependency and IaC misconfiguration scanning
+  # 6. Filesystem, secrets, dependency and IaC scanning
   trivy-filesystem:
     name: Trivy Filesystem and IaC
     runs-on: ubuntu-latest
@@ -206,8 +308,7 @@ jobs:
           exit-code: '1'
           format: table
 
-  # 7. Build and scan a Docker image when a root Dockerfile exists
-  
+  # 7. Build and scan a Docker image if a root Dockerfile exists
   container-security:
     name: Container Image Security
     runs-on: ubuntu-latest
@@ -215,7 +316,6 @@ jobs:
     if: needs.detect-stack.outputs.docker == 'true'
     permissions:
       contents: read
-      security-events: write
 
     steps:
       - name: Checkout
